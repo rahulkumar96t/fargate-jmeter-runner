@@ -1,0 +1,10 @@
+# JMeter plugins baked into the image, one <plugin-id>=<version> per line.
+# IDs and versions come from the Plugins Manager repository (https://jmeter-plugins.org/).
+# Pin versions: an unpinned entry installs whatever is newest at build time.
+
+# Concurrency, Arrivals and Ultimate thread groups (open/closed workload models)
+jpgc-casutg=3.1.1
+# Throughput Shaping Timer (target requests per second over time)
+jpgc-tst=2.6
+# Extra functions such as __env and __strReplace
+jpgc-functions=2.2

@@ -1,0 +1,7 @@
+# The build context is the repository root (docker build -f docker/Dockerfile .).
+# Send only the files the image needs; .terraform/ alone holds hundreds of MB.
+*
+!docker/entrypoint.sh
+!docker/runner.properties
+!docker/plugins.txt
+!tools/jtl_summary.py

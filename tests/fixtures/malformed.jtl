@@ -1,0 +1,4 @@
+timeStamp,elapsed,label,responseCode,responseMessage,threadName,dataType,success,failureMessage,bytes,sentBytes,grpThreads,allThreads,URL,Latency,IdleTime,Connect
+1700000000000,100,home,200,OK,Users 1-1,text,true,,512,120,1,1,https://perf.example.com/,90,0,10
+1700000001000,200,home,200,OK,Users 1-1
+1700000002000,not-a-number,home,200,OK,Users 1-1,text,true,,512,120,1,1,https://perf.example.com/,90,0,10

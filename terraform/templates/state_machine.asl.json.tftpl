@@ -1,0 +1,353 @@
+{
+  "Comment": "Distributed JMeter load test: validate the input, run N injectors on Fargate, merge the results into a report, notify.",
+  "StartAt": "LoadDefaults",
+  "States": {
+    "LoadDefaults": {
+      "Type": "Pass",
+      "Comment": "Run defaults and fixed values rendered by Terraform.",
+      "Result": {
+        "defaults": ${defaults_json},
+        "fixed": ${fixed_json}
+      },
+      "Next": "MergeInput"
+    },
+    "MergeInput": {
+      "Type": "Pass",
+      "Comment": "defaults, then the execution input, then the fixed values (shallow merge, later wins).",
+      "Parameters": {
+        "config.$": "States.JsonMerge(States.JsonMerge($.defaults, $$.Execution.Input, false), $.fixed, false)"
+      },
+      "OutputPath": "$.config",
+      "Next": "Validate"
+    },
+    "Validate": {
+      "Type": "Choice",
+      "Comment": "Each rule matches INVALID input. Nothing has been started yet, so a rejection costs nothing.",
+      "Choices": ${validation_choices_json},
+      "Default": "ResolveSize"
+    },
+%{ for rule in validation_rules ~}
+    "Reject${rule.name}": {
+      "Type": "Pass",
+      "Result": ${jsonencode({ Error = "InvalidInput", Cause = rule.cause })},
+      "ResultPath": "$.error",
+      "Next": "NotifyFailure"
+    },
+%{ endfor ~}
+    "ResolveSize": {
+      "Type": "Choice",
+      "Comment": "Map the injector size to a Fargate CPU/memory pair.",
+      "Choices": ${size_choices_json},
+      "Default": "RejectSize"
+    },
+    "RejectSize": {
+      "Type": "Pass",
+      "Result": ${jsonencode({ Error = "InvalidInput", Cause = "size must be one of ${join(", ", sort(keys(injector_sizes)))}" })},
+      "ResultPath": "$.error",
+      "Next": "NotifyFailure"
+    },
+%{ for size, spec in injector_sizes ~}
+    "Size${size}": {
+      "Type": "Pass",
+      "Result": { "cpu": "${spec.cpu}", "memory": "${spec.memory}" },
+      "ResultPath": "$.resources",
+      "Next": "PlanRun"
+    },
+%{ endfor ~}
+    "PlanRun": {
+      "Type": "Pass",
+      "Comment": "The execution name is the run id; it keys every S3 prefix of the run.",
+      "Parameters": {
+        "runId.$": "$$.Execution.Name",
+        "startAfter.$": "$$.Execution.StartTime",
+        "injectorIndexes.$": "States.ArrayRange(0, States.MathAdd($.injectors, -1), 1)",
+        "timeoutSeconds.$": "States.MathAdd($.durationSeconds, ${injector_timeout_padding})"
+      },
+      "ResultPath": "$.derived",
+      "Next": "RunInjectors"
+    },
+    "RunInjectors": {
+      "Type": "Map",
+      "Comment": "One iteration per injector. MaxConcurrency equals max_injectors (at most 40), so every injector runs at the same time.",
+      "ItemsPath": "$.derived.injectorIndexes",
+      "MaxConcurrency": ${max_injectors},
+      "ItemSelector": {
+        "index.$": "$$.Map.Item.Value",
+        "config.$": "$"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "RunInjector",
+        "States": {
+          "RunInjector": {
+            "Type": "Task",
+            "Comment": "Retries cover RunTask API errors only (the task never started). A task that fails mid-test is not retried: a late restart would distort the load profile.",
+            "Resource": "arn:${partition}:states:::ecs:runTask.sync",
+            "TimeoutSecondsPath": "$.config.derived.timeoutSeconds",
+            "Parameters": {
+              "Cluster": "${cluster_arn}",
+              "TaskDefinition": "${task_definition_arn}",
+              "LaunchType": "FARGATE",
+              "NetworkConfiguration": {
+                "AwsvpcConfiguration": {
+                  "Subnets": ${subnets_json},
+                  "SecurityGroups": ${security_groups_json},
+                  "AssignPublicIp": "DISABLED"
+                }
+              },
+              "Tags": [
+                { "Key": "jmeter-run-id", "Value.$": "$.config.derived.runId" },
+                { "Key": "jmeter-role", "Value": "injector" }
+              ],
+              "Overrides": {
+                "Cpu.$": "$.config.resources.cpu",
+                "Memory.$": "$.config.resources.memory",
+                "ContainerOverrides": [
+                  {
+                    "Name": "${container_name}",
+                    "Command": ["run"],
+                    "Environment": [
+                      { "Name": "RUN_ID", "Value.$": "$.config.derived.runId" },
+                      { "Name": "PLAN_KEY", "Value.$": "$.config.plan" },
+                      { "Name": "INJECTOR_INDEX", "Value.$": "States.Format('{}', $.index)" },
+                      { "Name": "INJECTOR_COUNT", "Value.$": "States.Format('{}', $.config.injectors)" },
+                      { "Name": "THREADS", "Value.$": "States.Format('{}', $.config.threads)" },
+                      { "Name": "RAMP_UP_SECONDS", "Value.$": "States.Format('{}', $.config.rampUpSeconds)" },
+                      { "Name": "DURATION_SECONDS", "Value.$": "States.Format('{}', $.config.durationSeconds)" },
+                      { "Name": "TARGET_HOST", "Value.$": "$.config.targetHost" },
+                      { "Name": "TARGET_PROTOCOL", "Value.$": "$.config.targetProtocol" },
+                      { "Name": "TARGET_PORT", "Value.$": "States.Format('{}', $.config.targetPort)" },
+                      { "Name": "JMETER_PROPERTIES", "Value.$": "$.config.properties" },
+                      { "Name": "START_AFTER", "Value.$": "$.config.derived.startAfter" },
+                      { "Name": "START_DELAY_SECONDS", "Value": "${start_delay_seconds}" }
+                    ]
+                  }
+                ]
+              }
+            },
+            "ResultSelector": {
+              "taskArn.$": "$.TaskArn"
+            },
+            "Retry": [
+              {
+                "ErrorEquals": ["ECS.AmazonECSException", "AmazonECS.Unknown"],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 3,
+                "BackoffRate": 2,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": "$.error",
+                "Next": "InjectorFailed"
+              }
+            ],
+            "End": true
+          },
+          "InjectorFailed": {
+            "Type": "Pass",
+            "Comment": "One failed injector does not stop the others; the report counts the missing results and fails the verdict.",
+            "Parameters": {
+              "index.$": "$.index",
+              "error.$": "$.error.Error"
+            },
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.injectorResults",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "BuildReport"
+    },
+    "BuildReport": {
+      "Type": "Task",
+      "Comment": "Merge the JTL files, build the HTML dashboard, summary.json and verdict.json.",
+      "Resource": "arn:${partition}:states:::ecs:runTask.sync",
+      "TimeoutSeconds": ${report_timeout_seconds},
+      "Parameters": {
+        "Cluster": "${cluster_arn}",
+        "TaskDefinition": "${task_definition_arn}",
+        "LaunchType": "FARGATE",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "Subnets": ${subnets_json},
+            "SecurityGroups": ${security_groups_json},
+            "AssignPublicIp": "DISABLED"
+          }
+        },
+        "Tags": [
+          { "Key": "jmeter-run-id", "Value.$": "$.derived.runId" },
+          { "Key": "jmeter-role", "Value": "report" }
+        ],
+        "Overrides": {
+          "Cpu": "${report_cpu}",
+          "Memory": "${report_memory}",
+          "TaskRoleArn": "${reporter_role_arn}",
+          "ContainerOverrides": [
+            {
+              "Name": "${container_name}",
+              "Command": ["report"],
+              "Environment": [
+                { "Name": "RUN_ID", "Value.$": "$.derived.runId" },
+                { "Name": "EXPECTED_INJECTORS", "Value.$": "States.Format('{}', $.injectors)" },
+                { "Name": "FAIL_IF", "Value.$": "$.thresholds" }
+              ]
+            }
+          ]
+        }
+      },
+      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": ["ECS.AmazonECSException", "AmazonECS.Unknown"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "LoadVerdict"
+    },
+    "LoadVerdict": {
+      "Type": "Task",
+      "Comment": "verdict.json is small and bounded; summary.json grows with the number of labels and could exceed the 256 KB state payload limit.",
+      "Resource": "arn:${partition}:states:::aws-sdk:s3:getObject",
+      "Parameters": {
+        "Bucket": "${bucket}",
+        "Key.$": "States.Format('reports/{}/verdict.json', $.derived.runId)"
+      },
+      "ResultSelector": {
+        "verdict.$": "States.StringToJson($.Body)"
+      },
+      "ResultPath": "$.report",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "CheckVerdict"
+    },
+    "CheckVerdict": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.report.verdict.passed",
+          "BooleanEquals": true,
+          "Next": "NotifySuccess"
+        }
+      ],
+      "Default": "NotifyVerdictFailed"
+    },
+    "NotifySuccess": {
+      "Type": "Task",
+      "Resource": "arn:${partition}:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${topic_arn}",
+        "Subject": "JMeter load test passed",
+        "Message.$": "States.Format('Run {} passed: {} samples, {} % errors, p95 {} ms, p99 {} ms, {} req/s from {} injectors of size {}. Report: s3://${bucket}/reports/{}/index.html', $.derived.runId, $.report.verdict.overall.count, $.report.verdict.overall.error_pct, $.report.verdict.overall.p95_ms, $.report.verdict.overall.p99_ms, $.report.verdict.overall.throughput_rps, $.injectors, $.size, $.derived.runId)"
+      },
+      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "Succeeded"
+    },
+    "NotifyVerdictFailed": {
+      "Type": "Task",
+      "Resource": "arn:${partition}:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${topic_arn}",
+        "Subject": "JMeter load test failed its checks",
+        "Message.$": "States.Format('Run {} failed its checks: {}. Samples: {}, errors: {} %, p95: {} ms. Report: s3://${bucket}/reports/{}/index.html', $.derived.runId, $.report.verdict.reason, $.report.verdict.overall.count, $.report.verdict.overall.error_pct, $.report.verdict.overall.p95_ms, $.derived.runId)"
+      },
+      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.notifyError",
+          "Next": "VerdictFailed"
+        }
+      ],
+      "Next": "VerdictFailed"
+    },
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:${partition}:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${topic_arn}",
+        "Subject": "JMeter load test errored",
+        "Message.$": "States.Format('Run {} did not complete: {}', $$.Execution.Name, States.JsonToString($.error))"
+      },
+      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.notifyError",
+          "Next": "Failed"
+        }
+      ],
+      "Next": "Failed"
+    },
+    "Succeeded": {
+      "Type": "Succeed"
+    },
+    "VerdictFailed": {
+      "Type": "Fail",
+      "Error": "VerdictFailed",
+      "CausePath": "$.report.verdict.reason"
+    },
+    "Failed": {
+      "Type": "Fail",
+      "ErrorPath": "$.error.Error",
+      "CausePath": "States.JsonToString($.error)"
+    }
+  }
+}

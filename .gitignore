@@ -1,0 +1,33 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+*.auto.tfvars
+terraform.tfvars
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local JMeter runs
+*.jtl
+!tests/fixtures/*.jtl
+jmeter.log
+report/
+work/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store

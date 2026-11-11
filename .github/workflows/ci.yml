@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    name: Terraform fmt, validate, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.2
+          terraform_wrapper: false
+
+      - name: Format
+        run: terraform fmt -check -recursive
+
+      - name: Validate module
+        working-directory: terraform
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+      - name: Validate examples/minimal
+        working-directory: examples/minimal
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+      - name: Test (mock provider, no AWS credentials)
+        working-directory: terraform
+        run: terraform test
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        run: |
+          command -v shellcheck >/dev/null || { sudo apt-get update && sudo apt-get install -y shellcheck; }
+          shellcheck --version
+          shellcheck docker/entrypoint.sh scripts/run-test.sh
+
+  python:
+    name: Python lint and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install
+        run: uv sync --locked
+
+      - name: Ruff
+        run: |
+          uv run ruff check
+          uv run ruff format --check
+
+      - name: Pytest (summary tool, entrypoint and run script)
+        run: uv run pytest
